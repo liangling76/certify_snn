@@ -6,6 +6,77 @@ import torch.nn.functional as F
 from snn_fire import m_th, alpha, time_step, get_time_step_certify, fire_func
 
 
+class BoundEncodeConv2d(Conv2d):
+    def __init__(self, cin, cout, kernel_size=3, stride=1, padding=1, bias=True):
+        super(BoundEncodeConv2d, self).__init__(in_channels=cin, out_channels=cout, kernel_size=kernel_size, 
+                stride=stride, padding=padding, dilation=1, groups=1, bias=bias)
+
+
+    def forward(self, input):
+        output = super(BoundEncodeConv2d, self).forward(input)
+        return output
+
+
+    def snn_bound(self, x_U, x_L):
+        mid = (x_U + x_L) / 2.0
+        diff = (x_U - x_L) / 2.0
+        weight_abs = self.weight.abs()
+
+        deviation = F.conv2d(diff, weight_abs, None, self.stride, self.padding, self.dilation, self.groups)
+        center = F.conv2d(mid, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+        self.output_shape = center.size()[1:]
+        self.input_shape = x_L.size()[1:]
+
+        m_U = center + deviation
+        m_L = center - deviation
+
+        return m_U, m_L
+
+
+    def snn_bound_back(self, last_mA_L): 
+        shape = last_mA_L.size()
+        output_padding0 = int(self.input_shape[1]) - (int(self.output_shape[1]) - 1) * self.stride[0] + 2 * self.padding[0] - int(self.weight.size()[2])
+        output_padding1 = int(self.input_shape[2]) - (int(self.output_shape[2]) - 1) * self.stride[1] + 2 * self.padding[1] - int(self.weight.size()[3]) 
+        
+        next_xA_L = F.conv_transpose2d(last_mA_L.view(shape[0] * shape[1], *shape[2:]), self.weight, None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups, output_padding=(output_padding0, output_padding1))     
+        next_xA_L = next_xA_L.view(shape[0], shape[1], *next_xA_L.shape[1:])
+
+        # get bias
+        bias_L = (last_mA_L.sum((3,4)) * self.bias).sum(2)
+
+        return next_xA_L, bias_L
+
+
+
+class BoundEncodeLinear(Linear):
+    def __init__(self, cin, cout, bias=True):
+        super(BoundEncodeLinear, self).__init__(cin, cout, bias)
+
+    def forward(self, input):
+        output = super(BoundEncodeLinear, self).forward(input)
+        return output
+
+    def snn_bound(self, x_U, x_L):
+        mid = (x_U + x_L) / 2.0
+        diff = (x_U - x_L) / 2.0
+        weight_abs = self.weight.abs()
+
+        center = torch.addmm(self.bias, mid, self.weight.t())
+        deviation = diff.matmul(weight_abs.t())
+
+        m_U = center + deviation
+        m_L = center - deviation
+
+        return m_U, m_L
+
+    def snn_bound_back(self, last_mA_L):
+        next_xA_L = last_mA_L.matmul(self.weight)
+        bias_L = last_mA_L.matmul(self.bias)
+
+        return next_xA_L, bias_L
+
+
 class BoundFlatten(nn.Module):
     def __init__(self):
         super(BoundFlatten, self).__init__()
@@ -250,17 +321,85 @@ class BoundMemUpdate(nn.Module):
             s_U.append(fire_func(m_U[t]))
             s_L.append(fire_func(m_L[t]))
 
-        #     print(torch.sum(s_U[t]), torch.sum(s_L[t]))
-        # print(self.time_step_certify, s_U[0].shape)
-        # print('\n')
         self.m_U, self.m_L = m_U, m_L
         self.s_U, self.s_L = s_U, s_L
         
         return m_U, s_U, m_L, s_L
 
-  
+
     @staticmethod
-    def _temporal_bound_backward(last_mA_L, x_U, x_L, y_U, y_L): # treat 1-s as x; m as y
+    def _temporal_bound_backward1(last_mA_L, x_U, x_L, y_U, y_L): # treat s as x; m as y
+
+        last_pos_mA_L, last_neg_mA_L = last_mA_L.clamp(min=0), last_mA_L.clamp(max=0)
+
+        x_U, x_L = x_U.unsqueeze(1), x_L.unsqueeze(1)
+        y_U, y_L = y_U.unsqueeze(1), y_L.unsqueeze(1)
+
+        x_U = x_U.view(x_U.size(0), x_U.size(1), -1)
+        x_L = x_L.view(x_U.shape)
+        y_U = y_U.view(x_U.shape)
+        y_L = y_L.view(x_U.shape)
+
+        # x always 0: xy=0
+        # x always 1: xy=y
+        next_yA_L = x_L * last_mA_L
+
+        # unstable x*y_l < xy < x*y_u
+        idx2 = (x_U == 1) * (x_L == 0)
+        y_L_tmp, y_U_tmp = torch.zeros_like(y_L), torch.zeros_like(y_U)
+        y_L_tmp[idx2] = y_L[idx2]
+        y_U_tmp[idx2] = y_U[idx2]
+        next_xA_L = y_L_tmp * last_pos_mA_L + y_U_tmp * last_neg_mA_L
+
+        shape_A = last_mA_L.shape
+
+        next_xA_L = next_xA_L.view(shape_A[0], shape_A[1], -1) 
+        next_yA_L = next_yA_L.view(shape_A[0], shape_A[1], -1) 
+
+        return next_xA_L, next_yA_L, 0
+
+
+    @staticmethod
+    def _temporal_bound_backward2(last_mA_L, x_U, x_L, y_U, y_L): # treat s as x; m as y
+
+        last_pos_mA_L, last_neg_mA_L = last_mA_L.clamp(min=0), last_mA_L.clamp(max=0)
+
+        x_U, x_L = x_U.unsqueeze(1), x_L.unsqueeze(1)
+        y_U, y_L = y_U.unsqueeze(1), y_L.unsqueeze(1)
+
+        x_U = x_U.view(x_U.size(0), x_U.size(1), -1)
+        x_L = x_L.view(x_U.shape)
+        y_U = y_U.view(x_U.shape)
+        y_L = y_L.view(x_U.shape)
+
+        # x always 0: xy=0
+        # x always 1: xy=y
+        next_yA_L = x_L * last_mA_L
+
+        # unstable 
+        idx2 = (x_U == 1) * (x_L == 0)
+        idx3 = idx2 * (y_L < 0)
+
+        y_L_tmp, y_U_tmp = torch.zeros_like(y_L), torch.zeros_like(y_U)
+        y_L_tmp[idx3] = y_L[idx3]
+        y_U_tmp[idx3] = y_U[idx3]
+
+        lower_d = y_L_tmp / (y_L_tmp - y_U_tmp - 1e-10)
+        lower_b = (- lower_d * y_U_tmp)
+
+        next_yA_L += (lower_d * last_pos_mA_L + idx2 * last_neg_mA_L)
+
+        shape_A = last_mA_L.shape
+        next_yA_L = next_yA_L.view(shape_A[0], shape_A[1], -1) 
+
+        next_bias_L = last_pos_mA_L.matmul(lower_b.view(lower_b.size(0), -1, 1))
+        next_bias_L = next_bias_L.squeeze(-1)
+
+        return torch.zeros_like(next_yA_L), next_yA_L, next_bias_L
+
+
+    @staticmethod
+    def _temporal_bound_backward3(last_mA_L, x_U, x_L, y_U, y_L): # treat s as x; m as y
 
         last_pos_mA_L, last_neg_mA_L = last_mA_L.clamp(min=0), last_mA_L.clamp(max=0)
 
@@ -360,11 +499,11 @@ class BoundMemUpdate(nn.Module):
                 tmp_mA_L = alpha * next_mA_L[t]
 
                 # upper and lower bound for 1-s  
-                x_U, m_U = 1 - self.s_L[t - 1], self.m_U[t - 1]
-                x_L, m_L = 1 - self.s_U[t - 1], self.m_L[t - 1]
+                s_U, m_U = 1 - self.s_L[t - 1], self.m_U[t - 1]
+                s_L, m_L = 1 - self.s_U[t - 1], self.m_L[t - 1]
 
                 # back propagate of alpha*(1-s) treat s as x
-                tp_sA_L, tp_mA_L, tp_bias_L = self._temporal_bound_backward(tmp_mA_L, x_U, x_L, m_U, m_L)
+                tp_sA_L, tp_mA_L, tp_bias_L = self._temporal_bound_backward3(tmp_mA_L, s_U, s_L, m_U, m_L)
 
 
                 next_mA_L[t - 1] += tp_mA_L
